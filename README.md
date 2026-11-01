@@ -1,5 +1,7 @@
 # aerial-object-detection
 
+English · [Türkçe](README.tr.md)
+
 Small object detection in drone images: YOLO11s trained on
 [VisDrone2019-DET](https://github.com/VisDrone/VisDrone-Dataset) (10 classes, many objects under
 32 pixels) at two input sizes, then run without Ultralytics through ONNX Runtime with my own
