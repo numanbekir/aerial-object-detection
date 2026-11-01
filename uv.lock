@@ -668,7 +668,7 @@ wheels = [
 [[package]]
 name = "detection-eval"
 version = "0.1.0"
-source = { git = "https://github.com/numanbekir/detection-eval?branch=main#9f98532c7704b9605f450b92cb54b61ff6fa1495" }
+source = { git = "https://github.com/numanbekir/detection-eval?branch=main#6dce488fda0603d7e0f6677d820973760025f79f" }
 dependencies = [
     { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and sys_platform == 'darwin'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and sys_platform != 'darwin'" },
