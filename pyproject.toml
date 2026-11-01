@@ -1,0 +1,31 @@
+[project]
+name = "aerial-object-detection"
+version = "0.1.0"
+description = "Small object detection in drone images: YOLO11 on VisDrone, ONNX Runtime without Ultralytics, measured with detection-eval."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Numan Bekir Özçelik" }]
+dependencies = [
+    "detection-eval",
+    "numpy>=1.24",
+    "onnxruntime>=1.23.2",
+    "pillow>=12.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pycocotools>=2.0.11",
+    "pytest>=8",
+]
+train = ["ultralytics==8.4.175"]
+
+[tool.uv.sources]
+detection-eval = { git = "https://github.com/numanbekir/detection-eval", branch = "main" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
