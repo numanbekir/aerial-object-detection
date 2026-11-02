@@ -93,16 +93,61 @@ nesnelerde değil, tüm boyutlara yayılmış.
 Görüntü başına CPU süresi (i7-11800H, ONNX Runtime): 640'ta model 49 ms / toplam 73 ms,
 1280'de 264 ms / 303 ms.
 
+## Parçalı Çıkarım (SAHI Tarzı)
+
+640 model ayrıca tam çözünürlükte, üst üste binen 640 × 640 parçalarda (örtüşme 128) ve bir kez
+de görüntünün tamamında çalıştırıldı. Parçalardaki kutular görüntü piksellerine kaydırılıp
+birleştirildi. Aynı model çalışmalarından üç birleştirme kuralı ölçüldü (`slicing.py`):
+
+- `nms`: sınıfa duyarlı NMS, IoU 0.7.
+- `edge`: parçanın iç kenarına değen kutuları at, sonra NMS. Kesilen nesne komşu parçada ya da
+  tam görüntü geçişinde bütün görünüyor.
+- `ios`: SAHI'nin varsayılanı (açgözlü birleştirme, IoS 0.5). Aynı sınıftan, kesişimi küçük
+  kutunun alanına oranı 0.5'ten büyük olan her kutu, hepsini kapsayan tek kutuda birleşiyor.
+
+VisDrone val, pycocotools, CPU'da ONNX Runtime:
+
+| | mAP50 | mAP50-95 | AP küçük | AP orta | AP büyük | görüntü başına ms |
+|---|---|---|---|---|---|---|
+| 640 | 0.355 | 0.211 | 0.115 | 0.326 | 0.455 | 73 |
+| 640 + parçalar, `nms` | 0.407 | 0.247 | 0.168 | 0.342 | 0.425 | 510–560 |
+| 640 + parçalar, `edge` | **0.425** | **0.259** | **0.176** | **0.358** | 0.436 | 510–560 |
+| 640 + parçalar, `ios` | 0.268 | 0.139 | 0.079 | 0.201 | 0.287 | 510–560 |
+| 1280 | 0.505 | 0.316 | 0.227 | 0.438 | 0.537 | 303 |
+
+(Kalın: parçalı satırların en iyisi.) Bir val görüntüsü ortalama 6.2 model çalışması istiyor;
+birleştirme sürenin 14–24 ms'si.
+
+- **Yarım kutular önemli.** Parça sınırında kesilen nesne yarım bir kutu veriyor; tam kutuyla
+  IoU'su NMS'in silmesi için çok düşük. Bunları atmak (`edge`) `nms`'e göre her sütunu
+  iyileştiriyor. car AP50 0.777 → 0.833: arabalar kalabalık ve sık sık parça sınırını kesiyor.
+- **Büyük nesneler yarım kutular olmadan da parçalamasız 640'ın altında** (0.436'ya karşı
+  0.455). Olası sebep ölçek: model parçalarda nesneleri eğitildiği boyutun yaklaşık iki katı
+  büyüklükte görüyor.
+- **SAHI'nin varsayılanı mAP eşiklerinde çöküyor.** Ölçümde 0.001 skora kadar kutular tutuluyor.
+  Bütün bir kalabalığı kaplayan düşük skorlu bir kutu içindeki her kişiyi kapsıyor (IoS 1.0);
+  emin olunan kişi kutuları kalabalık boyutuna büyüyüp yanlış pozitif oluyor: people AP50
+  0.061'e düşüyor. İlk 80 görüntüde aynı IoS kuralı kutuları büyütmeden 0.436 veriyor
+  (`edge`: 0.438); 0.25'in altındaki kutular önce atılınca da birleştirme NMS'in biraz önüne
+  geçiyor (0.399'a karşı 0.393). Bu kural ekranda gösterilen tespitlere uygun, düşük eşikli
+  ölçüme değil.
+- **1280'de eğitmek hâlâ daha iyi:** her sütunda önde ve 640 modeli parçalamaktan hızlı.
+  Parçalama, büyük girişle yeniden eğitim mümkün değilse ya da görüntüler 1360 × 765'ten çok
+  daha büyükse işe yarıyor.
+
 ## Nasıl Çalışıyor
 
 ```
 src/aerial_object_detection/
   decode.py        letterbox, ham YOLO çıktısı -> kutular, orijinal piksellere geri dönüş
+  onnx_detector.py ONNX Runtime modeli + kutu çözme + NMS tek çağrıda
+  slicing.py       parça konumları, parça kutularını geri kaydırma, birleştirme (nms, edge, ios)
 scripts/
   train.py         VisDrone'da YOLO11 eğitimi (Ultralytics)
   predict_coco.py  bir bölümde Ultralytics predict, tespitler COCO results JSON olarak
   inspect_onnx.py  bir ONNX modelinin giriş / çıkış şekilleri ve ham adayları
   predict_onnx.py  ONNX Runtime + decode.py + NMS, Ultralytics olmadan COCO results JSON
+  predict_sliced.py aynısı parçalarda + tam görüntüde, her birleştirme kuralı için bir JSON
 ```
 
 Ölçüm: detection-eval'deki `scripts/eval_coco.py` (pycocotools ve detection-eval yan yana).
@@ -115,7 +160,7 @@ dönüştür, sonra YAML'ı `path` veri setini gösterecek şekilde `data/VisDro
 
 ```bash
 uv sync                  # detection-eval, numpy, pillow, onnxruntime + pycocotools, pytest
-uv run pytest -q         # 14 test
+uv run pytest -q         # 407 test
 ```
 
 Eğitim ve Ultralytics ile tahmin (`uv sync --group train`):
@@ -133,6 +178,8 @@ ONNX Runtime (dışa aktarmanın kendisi Ultralytics ister):
 yolo export model=runs/visdrone_yolo11s_640_baseline/weights/best.pt format=onnx imgsz=640
 uv run python scripts/predict_onnx.py --model runs/visdrone_yolo11s_640_baseline/weights/best.onnx \
     --out runs/coco_eval/yolo11s_640_onnx_val/detections.json
+uv run python scripts/predict_sliced.py --model runs/visdrone_yolo11s_640_baseline/weights/best.onnx \
+    --merge nms edge ios --out "runs/coco_eval/yolo11s_640_sliced_{merge}_val/detections.json"
 ```
 
 Test-dev için `--images data/VisDrone/images/test` ekle. Ölçüm, detection-eval klasöründen:
@@ -155,7 +202,6 @@ Eğitim ayarları: COCO'da önceden eğitilmiş ağırlıklardan YOLO11s, 50 epo
 
 ## Sırada
 
-- Parçalı çıkarım (SAHI tarzı): tam çözünürlükte parçalar, NMS ile birleştirme, val'de ölçüm.
 - Video ve FPS.
 - Hız ve mAP tablosu: PyTorch, ONNX Runtime, TensorRT FP16, tarayıcı.
 

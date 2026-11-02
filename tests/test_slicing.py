@@ -2,7 +2,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from aerial_object_detection.slicing import predict_sliced, tile_origins, tile_starts
+from aerial_object_detection.slicing import (
+    box_ios, merge_ios, predict_sliced, sliced_candidates, tile_origins, tile_starts,
+)
 
 
 # ---- the VisDrone example ------------------------------------------------------
@@ -156,3 +158,57 @@ def test_max_det():
     xyxy, scores, _ = predict_sliced(scene(1360, 765), many, max_det=20)
     assert len(xyxy) == 20
     assert list(scores) == sorted(scores, reverse=True)
+
+
+# ---- tile borders and the merge methods ---------------------------------------
+
+def test_box_ios():
+    full, half = [600, 0, 700, 10], [600, 0, 640, 10]
+    assert box_ios([full], [half]).tolist() == [[1.0]]
+    assert box_ios([[0, 0, 10, 10]], [[20, 20, 30, 30]]).tolist() == [[0.0]]
+    assert box_ios([[0, 0, 10, 10]], [[5, 0, 15, 10]]).tolist() == [[0.5]]
+
+
+def test_cut_box_is_marked_at_edge():
+    # 630-650 crosses the inner border at 640: tile 0-640 sees 630-640 and marks it.
+    xyxy, _, _, at_edge = sliced_candidates(scene(1360, 765, (630, 100, 650, 120)), WhiteSquareDetector())
+    marked = sorted(b for b, e in zip(xyxy.tolist(), at_edge) if e)
+    assert marked == [[630, 100, 640, 120]]
+
+
+def test_image_border_is_not_an_inner_edge():
+    # x 1340-1360 touches the right border of the image, not a border between tiles.
+    xyxy, _, _, at_edge = sliced_candidates(scene(1360, 765, (1340, 100, 1360, 120)), WhiteSquareDetector())
+    assert not at_edge.any()
+
+
+def test_edge_merge_removes_the_partial_box():
+    xyxy, _, _ = predict_sliced(scene(1360, 765, (630, 100, 650, 120)), WhiteSquareDetector(), merge="edge")
+    assert xyxy.tolist() == [[630, 100, 650, 120]]
+
+
+def test_ios_merge_removes_the_partial_box():
+    xyxy, _, _ = predict_sliced(scene(1360, 765, (630, 100, 650, 120)), WhiteSquareDetector(), merge="ios")
+    assert xyxy.tolist() == [[630, 100, 650, 120]]
+
+
+def test_ios_merge_grows_a_higher_scored_partial_box():
+    # The partial box scores higher than the whole one: it is kept and grows to cover both.
+    boxes = np.array([[630, 100, 640, 120], [630, 100, 650, 120]], dtype=float)
+    xyxy, scores, _ = merge_ios(boxes, np.array([0.9, 0.8]), np.array([0, 0]), np.array([True, False]))
+    assert xyxy.tolist() == [[630, 100, 650, 120]]
+    assert scores.tolist() == [0.9]
+
+
+def test_ios_merge_keeps_classes_apart():
+    boxes = np.array([[0, 0, 100, 100], [10, 10, 30, 30]], dtype=float)
+    xyxy, _, classes = merge_ios(boxes, np.array([0.9, 0.8]), np.array([5, 0]), np.array([False, False]))
+    assert sorted(classes.tolist()) == [0, 5]
+    assert len(xyxy) == 2
+
+
+def test_ios_merge_swallows_a_small_box_inside_a_large_one():
+    # The risk of IoS: a large box of the same class absorbs a separate small one.
+    boxes = np.array([[0, 0, 100, 100], [10, 10, 30, 30]], dtype=float)
+    xyxy, _, _ = merge_ios(boxes, np.array([0.3, 0.9]), np.array([0, 0]), np.array([False, False]))
+    assert xyxy.tolist() == [[0, 0, 100, 100]]

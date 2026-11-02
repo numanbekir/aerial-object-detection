@@ -93,16 +93,60 @@ only small ones.
 CPU time per image (i7-11800H, ONNX Runtime): 49 ms model / 73 ms in total at 640,
 264 ms / 303 ms at 1280.
 
+## Sliced Inference (SAHI-style)
+
+The 640 model also runs on overlapping 640 × 640 tiles at full resolution (overlap 128), plus
+once on the whole image. Tile boxes are shifted back to image pixels and merged. Three merge
+rules were scored from the same model runs (`slicing.py`):
+
+- `nms`: class-aware NMS, IoU 0.7.
+- `edge`: drop boxes that touch an inner tile border, then NMS. A cut object shows up whole in
+  the neighbouring tile or in the whole-image pass.
+- `ios`: the SAHI default (greedy merging, IoS 0.5). Every same-class box whose
+  intersection-over-smaller-area is above 0.5 is merged into one box that covers them all.
+
+VisDrone val, pycocotools, ONNX Runtime on CPU:
+
+| | mAP50 | mAP50-95 | AP small | AP medium | AP large | ms per image |
+|---|---|---|---|---|---|---|
+| 640 | 0.355 | 0.211 | 0.115 | 0.326 | 0.455 | 73 |
+| 640 + tiles, `nms` | 0.407 | 0.247 | 0.168 | 0.342 | 0.425 | 510–560 |
+| 640 + tiles, `edge` | **0.425** | **0.259** | **0.176** | **0.358** | 0.436 | 510–560 |
+| 640 + tiles, `ios` | 0.268 | 0.139 | 0.079 | 0.201 | 0.287 | 510–560 |
+| 1280 | 0.505 | 0.316 | 0.227 | 0.438 | 0.537 | 303 |
+
+(Bold: best of the tiling rows.) A val image needs 6.2 model runs on average; merging takes
+14–24 ms of the time.
+
+- **Partial boxes matter.** An object cut by a tile border gives a partial box whose IoU with
+  the full box is too low for NMS to remove it. Dropping them (`edge`) improves every column
+  over `nms`. car AP50 goes 0.777 → 0.833: cars are dense and often cross tile borders.
+- **Large objects are still below plain 640** (0.436 vs 0.455) even without partial boxes. The
+  likely cause is scale: in the tiles the model sees objects at about twice the size it was
+  trained on.
+- **The SAHI default collapses at mAP thresholds.** Scoring keeps boxes down to score 0.001. A
+  low-score box covering a whole crowd contains every person in it (IoS 1.0), so confident
+  person boxes grow into crowd-sized boxes and become false positives: people AP50 falls to
+  0.061. On the first 80 images, the same IoS rule without growing the boxes scores 0.436
+  (`edge`: 0.438), and with boxes below 0.25 dropped first the union merge is slightly ahead of
+  NMS (0.399 vs 0.393). The rule suits on-screen detections, not low-threshold evaluation.
+- **Training at 1280 is still better** on every column and faster than tiling the 640 model.
+  Tiling pays off when retraining at a larger input is not possible or images are much larger
+  than 1360 × 765.
+
 ## How It Works
 
 ```
 src/aerial_object_detection/
   decode.py        letterbox, raw YOLO output -> boxes, back to original pixels
+  onnx_detector.py ONNX Runtime model + decode + NMS as one callable
+  slicing.py       tile positions, shifting tile boxes back, merging (nms, edge, ios)
 scripts/
   train.py         train YOLO11 on VisDrone (Ultralytics)
   predict_coco.py  Ultralytics predict on a split, detections as COCO results JSON
   inspect_onnx.py  input / output shapes and raw candidates of an ONNX model
   predict_onnx.py  ONNX Runtime + decode.py + NMS, COCO results JSON without Ultralytics
+  predict_sliced.py the same on tiles + the whole image, one JSON per merge rule
 ```
 
 Scoring: `scripts/eval_coco.py` in detection-eval (pycocotools and detection-eval side by side).
@@ -115,7 +159,7 @@ then put the YAML at `data/VisDrone.yaml` with `path` pointing to the dataset.
 
 ```bash
 uv sync                  # detection-eval, numpy, pillow, onnxruntime + pycocotools, pytest
-uv run pytest -q         # 14 tests
+uv run pytest -q         # 407 tests
 ```
 
 Training and Ultralytics prediction (`uv sync --group train`):
@@ -133,6 +177,8 @@ ONNX Runtime (the export itself needs Ultralytics):
 yolo export model=runs/visdrone_yolo11s_640_baseline/weights/best.pt format=onnx imgsz=640
 uv run python scripts/predict_onnx.py --model runs/visdrone_yolo11s_640_baseline/weights/best.onnx \
     --out runs/coco_eval/yolo11s_640_onnx_val/detections.json
+uv run python scripts/predict_sliced.py --model runs/visdrone_yolo11s_640_baseline/weights/best.onnx \
+    --merge nms edge ios --out "runs/coco_eval/yolo11s_640_sliced_{merge}_val/detections.json"
 ```
 
 For test-dev, add `--images data/VisDrone/images/test`. Scoring, from a detection-eval checkout:
@@ -154,7 +200,6 @@ Training settings: YOLO11s from COCO-pretrained weights, 50 epochs, seed 0, batc
 
 ## Next
 
-- Sliced inference (SAHI-style): tiles at full resolution, merged with NMS, measured on val.
 - Video and FPS.
 - Speed and mAP table: PyTorch, ONNX Runtime, TensorRT FP16, browser.
 
