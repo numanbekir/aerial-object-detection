@@ -178,6 +178,35 @@ pycocotools.
   laptop CPU ile GPU arasında tek bir güç bütçesi paylaştırdığı için. Yukarıdaki bütün satırlar
   `performance` modunda, tek oturumda ölçüldü.
 
+## Video
+
+İki model, İstanbul'da Haliç üzerindeki bir köprünün 4K, 60 FPS'lik dron videosunda
+([Pexels](https://www.pexels.com/video/aerial-view-of-istanbul-s-halic-bridge-traffic-34234190/), repoda yok); TensorRT FP16,
+GPU letterbox (`scripts/video.py`). 622 karenin ortancası, skor ≥ 0.25, güç modu `balanced`:
+
+| Giriş | Kare çözme | Tespit | Çizim | Toplam | FPS | Kare başına nesne |
+|---|---|---|---|---|---|---|
+| 640 | 3.6 ms | 11.5 ms | 0.9 ms | 16.1 ms | **62** | 32.5 |
+| 1280 | 3.7 ms | 17.5 ms | 1.2 ms | 22.4 ms | 45 | **58.8** |
+
+![Aynı kare 640'ta (sol) ve 1280'de (sağ)](docs/video_640_vs_1280.jpg)
+
+- **640, 60 FPS'lik videoya yetişiyor; 1280 %81 daha fazla nesne buluyor.** Kazancın çoğu
+  köprüdeki insanlar ve uzaktaki arabalar: 640 için 4K kare 6 kat küçülüyor, uzaktaki bir araba
+  modele 3–4 piksel olarak ulaşıyor. İkisi de korkuluk boyunca yan yana oturan insanların çoğunu
+  kaçırıyor.
+- **Tespit VisDrone görüntülerine göre iki kat pahalı** (640'ta 5.6 yerine 11.5 ms). 4K kare
+  24.9 MB, 1360 × 765'lik bir görüntünün 8 katı: GPU'ya kopyalamak 3.8 ms, antialias'lı küçültme
+  3.2 ms (antialias'sız 1.3 ms) sürüyor. Her yeni piksel artık yaklaşık 6 × 6 kaynak pikselin
+  ortalaması, yani antialias artık bedava değil.
+- **4 kat piksel, 2.7 kat model süresi.** 1280 model 2.4 yerine 6.5 ms sürüyor: 640'ta GPU tam
+  dolmuyor.
+- **60 FPS'lik kamerada 45 FPS**, canlı bir sistemde her 4 kareden birinin atlanması demek (her
+  kareyi kuyruğa koymak her saniye 0.25 sn gecikme ekler). 30 FPS'lik bir kamerada 1280 model
+  kare başına yaklaşık 11 ms pay bırakarak yetişiyor.
+- FPS kare çözme, tespit ve çizimi kapsıyor. Çıktı dosyasına yazma (1920 × 1080'de kare başına
+  yaklaşık 10 ms) ve pencere gösterme (yaklaşık 5 ms) dahil değil.
+
 ## Nasıl Çalışıyor
 
 ```
@@ -185,6 +214,7 @@ src/aerial_object_detection/
   decode.py        letterbox, ham YOLO çıktısı -> kutular, orijinal piksellere geri dönüş
   onnx_detector.py ONNX Runtime modeli + kutu çözme + NMS tek çağrıda
   slicing.py       parça konumları, parça kutularını geri kaydırma, birleştirme (nms, edge, ios)
+  runtimes.py      ONNX Runtime, PyTorch ve TensorRT tek çağrının arkasında, CPU ya da GPU letterbox
 scripts/
   train.py         VisDrone'da YOLO11 eğitimi (Ultralytics)
   predict_coco.py  bir bölümde Ultralytics predict, tespitler COCO results JSON olarak
@@ -192,6 +222,7 @@ scripts/
   predict_onnx.py  ONNX Runtime + decode.py + NMS, Ultralytics olmadan COCO results JSON
   predict_sliced.py aynısı parçalarda + tam görüntüde, her birleştirme kuralı için bir JSON
   benchmark.py     bir modelin süresi: ONNX Runtime, PyTorch ya da TensorRT, CPU ya da GPU letterbox
+  video.py         bir videonun her karesinde kutular, adım başına süre, FPS
 ```
 
 Ölçüm: detection-eval'deki `scripts/eval_coco.py` (pycocotools ve detection-eval yan yana).
@@ -238,6 +269,14 @@ python scripts/benchmark.py --runtime trt --model runs/trt_640_fp16/best.engine 
     --count 548 --warmup 0 --conf 0.001 --out runs/coco_eval/yolo11s_640_trt_fp16_gpuprepaa_val/detections.json
 ```
 
+Video (`--show` pencere açar, `--out` mp4 yazar):
+
+```bash
+python scripts/video.py --video data/videos/bridge_4k60.mp4 --model runs/trt_640_fp16/best.engine \
+    --out runs/video/bridge_640.mp4
+ffmpeg -i runs/video/bridge_640.mp4 -c:v libx264 -crf 20 -pix_fmt yuv420p runs/video/bridge_640_h264.mp4
+```
+
 Test-dev için `--images data/VisDrone/images/test` ekle. Ölçüm, detection-eval klasöründen:
 
 ```bash
@@ -258,7 +297,8 @@ Eğitim ayarları: COCO'da önceden eğitilmiş ağırlıklardan YOLO11s, 50 epo
 
 ## Sırada
 
-- Video ve FPS.
+- Takip: kareler boyunca her nesneye tek bir numara; kutu değil araç saymak için.
+- 1280 ile 4K'da 60 FPS: GPU bu kareyi işlerken bir sonraki kareyi çözmek.
 - Hız tablosuna: tarayıcı (ONNX Runtime Web) ve TensorRT INT8.
 
 ## Lisans

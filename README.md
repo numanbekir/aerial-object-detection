@@ -176,6 +176,35 @@ From the first GPU row to the last: 2.7× faster, mAP50 −0.0013.
   `balanced`, likely because the laptop shares one power budget between CPU and GPU. All rows
   above are from one session in `performance` mode.
 
+## Video
+
+Both models on a 4K, 60 FPS drone video of a bridge over the Golden Horn in Istanbul
+([Pexels](https://www.pexels.com/video/aerial-view-of-istanbul-s-halic-bridge-traffic-34234190/), not included), TensorRT FP16
+with the GPU letterbox (`scripts/video.py`). Medians over 622 frames, score ≥ 0.25, power mode
+`balanced`:
+
+| Input | Decode | Detect | Draw | Total | FPS | Objects per frame |
+|---|---|---|---|---|---|---|
+| 640 | 3.6 ms | 11.5 ms | 0.9 ms | 16.1 ms | **62** | 32.5 |
+| 1280 | 3.7 ms | 17.5 ms | 1.2 ms | 22.4 ms | 45 | **58.8** |
+
+![The same frame at 640 (left) and 1280 (right)](docs/video_640_vs_1280.jpg)
+
+- **640 keeps up with the 60 FPS video, 1280 finds 81% more objects.** Most of the gain is people
+  on the bridge and far cars: the 4K frame is shrunk 6× for 640, so a far car reaches the model
+  as 3–4 pixels. Both miss most of the people sitting close together along the railing.
+- **Detection costs twice as much as on VisDrone images** (11.5 vs 5.6 ms at 640). A 4K frame is
+  24.9 MB, 8× a 1360 × 765 image: copying it to the GPU takes 3.8 ms and the antialiased resize
+  3.2 ms (1.3 ms without antialias). Each new pixel now averages about 6 × 6 source pixels, so
+  antialias is no longer free.
+- **4× the pixels, 2.7× the model time.** The 1280 model takes 6.5 ms instead of 2.4 ms: at 640 the
+  GPU is not fully used.
+- **45 FPS on a 60 FPS camera** means one frame in four has to be skipped in a live system
+  (queueing every frame would add 0.25 s of delay every second). On a 30 FPS camera the 1280 model
+  keeps up with about 11 ms to spare per frame.
+- FPS counts decode, detect and draw. Writing the output file (about 10 ms per frame at
+  1920 × 1080) and showing a window (about 5 ms) are not included.
+
 ## How It Works
 
 ```
@@ -183,6 +212,7 @@ src/aerial_object_detection/
   decode.py        letterbox, raw YOLO output -> boxes, back to original pixels
   onnx_detector.py ONNX Runtime model + decode + NMS as one callable
   slicing.py       tile positions, shifting tile boxes back, merging (nms, edge, ios)
+  runtimes.py      ONNX Runtime, PyTorch and TensorRT behind one call, CPU or GPU letterbox
 scripts/
   train.py         train YOLO11 on VisDrone (Ultralytics)
   predict_coco.py  Ultralytics predict on a split, detections as COCO results JSON
@@ -190,6 +220,7 @@ scripts/
   predict_onnx.py  ONNX Runtime + decode.py + NMS, COCO results JSON without Ultralytics
   predict_sliced.py the same on tiles + the whole image, one JSON per merge rule
   benchmark.py     time one model with ONNX Runtime, PyTorch or TensorRT, CPU or GPU letterbox
+  video.py         boxes on every frame of a video, time per stage, FPS
 ```
 
 Scoring: `scripts/eval_coco.py` in detection-eval (pycocotools and detection-eval side by side).
@@ -236,6 +267,14 @@ python scripts/benchmark.py --runtime trt --model runs/trt_640_fp16/best.engine 
     --count 548 --warmup 0 --conf 0.001 --out runs/coco_eval/yolo11s_640_trt_fp16_gpuprepaa_val/detections.json
 ```
 
+Video (`--show` opens a window, `--out` writes an mp4):
+
+```bash
+python scripts/video.py --video data/videos/bridge_4k60.mp4 --model runs/trt_640_fp16/best.engine \
+    --out runs/video/bridge_640.mp4
+ffmpeg -i runs/video/bridge_640.mp4 -c:v libx264 -crf 20 -pix_fmt yuv420p runs/video/bridge_640_h264.mp4
+```
+
 For test-dev, add `--images data/VisDrone/images/test`. Scoring, from a detection-eval checkout:
 
 ```bash
@@ -255,7 +294,8 @@ Training settings: YOLO11s from COCO-pretrained weights, 50 epochs, seed 0, batc
 
 ## Next
 
-- Video and FPS.
+- Tracking: one id per object across frames, to count vehicles instead of boxes.
+- 4K at 60 FPS with 1280: decode the next frame while the GPU works on this one.
 - In the speed table: the browser (ONNX Runtime Web) and TensorRT INT8.
 
 ## License
