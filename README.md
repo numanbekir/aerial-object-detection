@@ -5,7 +5,7 @@ English · [Türkçe](README.tr.md)
 Small object detection in drone images: YOLO11s trained on
 [VisDrone2019-DET](https://github.com/VisDrone/VisDrone-Dataset) (10 classes, many objects under
 32 pixels) at two input sizes, then run without Ultralytics through ONNX Runtime with my own
-letterbox, decoding and NMS.
+letterbox, decoding and NMS, and timed from PyTorch to TensorRT FP16.
 
 Every mAP here is pycocotools, reproduced to the last digit by
 [detection-eval](https://github.com/numanbekir/detection-eval), my evaluation code written from
@@ -134,6 +134,48 @@ VisDrone val, pycocotools, ONNX Runtime on CPU:
   Tiling pays off when retraining at a larger input is not possible or images are much larger
   than 1360 × 765.
 
+## Speed
+
+The 640 model on one GPU and one CPU, from PyTorch to TensorRT FP16. The pipeline is the same in
+every row (`scripts/benchmark.py`): letterbox, model, decoding, class-aware NMS, boxes back to
+image pixels. Only the model call and, in the last two rows, the letterbox change.
+
+- **Model:** the model call alone, including copying the input to the GPU and the output back.
+- **Total:** from a decoded image to the final boxes (disk reads and JPEG decoding not
+  included).
+
+Median of 100 val images after 10 warm-up images, one image at a time, score ≥ 0.25.
+RTX 3060 Laptop 6 GB, i7-11800H, power mode `performance`. mAP: all of val, score ≥ 0.001,
+pycocotools.
+
+| Runtime | Letterbox | Model ms | Total ms | FPS | mAP50 | AP small |
+|---|---|---|---|---|---|---|
+| ONNX Runtime, CPU | Pillow, CPU | 45.4 | 52.2 | 19 | 0.3550 | 0.115 |
+| PyTorch, CPU | Pillow, CPU | 42.2 | 49.2 | 20 | | |
+| PyTorch, GPU FP32 | Pillow, CPU | 7.9 | 15.2 | 66 | 0.3552 | 0.115 |
+| PyTorch, GPU FP16 | Pillow, CPU | 7.4 | 14.3 | 70 | 0.3546 | 0.114 |
+| TensorRT FP32 | Pillow, CPU | 7.2 | 14.2 | 71 | 0.3549 | 0.115 |
+| TensorRT FP16 | Pillow, CPU | 4.0 | 11.6 | 86 | 0.3548 | 0.115 |
+| TensorRT FP16 | GPU bilinear | 2.5 | 5.8 | 172 | 0.3469 | 0.111 |
+| TensorRT FP16 | **GPU bilinear, antialias** | **2.4** | **5.6** | **178** | **0.3539** | **0.115** |
+
+From the first GPU row to the last: 2.7× faster, mAP50 −0.0013.
+
+- **FP16 costs nothing in accuracy.** Every FP16 row is within 0.0006 mAP50 of FP32.
+- **TensorRT and FP16 pay off together.** Each alone saves under 1 ms; together they halve the
+  model time. In PyTorch, FP16 does speed up the GPU work by 1.55× (6.3 → 4.1 ms with the input
+  already on the GPU), but copying the 4.9 MB FP32 input takes most of the gain back.
+- **Then the letterbox is the bottleneck.** With TensorRT FP16, 7.6 of the 11.6 ms are CPU work,
+  most of it the Pillow resize (about 6 ms per image). Sending the 0–255 image to the GPU and
+  resizing there halves the total time and also removes the input copy from the model time.
+- **The resize method shows up in mAP again.** Plain bilinear on the GPU reads only the nearest
+  source pixels and gives 0.3469, the same as OpenCV `INTER_LINEAR` above. With antialias it
+  averages every pixel it replaces, as Pillow does, and gets 0.3539 back at no measurable cost.
+- **The power mode is part of the measurement.** In `balanced` mode the same ONNX Runtime CPU
+  run takes 70 ms instead of 45 ms. The GPU rows go the other way, about 10% faster in
+  `balanced`, likely because the laptop shares one power budget between CPU and GPU. All rows
+  above are from one session in `performance` mode.
+
 ## How It Works
 
 ```
@@ -147,6 +189,7 @@ scripts/
   inspect_onnx.py  input / output shapes and raw candidates of an ONNX model
   predict_onnx.py  ONNX Runtime + decode.py + NMS, COCO results JSON without Ultralytics
   predict_sliced.py the same on tiles + the whole image, one JSON per merge rule
+  benchmark.py     time one model with ONNX Runtime, PyTorch or TensorRT, CPU or GPU letterbox
 ```
 
 Scoring: `scripts/eval_coco.py` in detection-eval (pycocotools and detection-eval side by side).
@@ -181,6 +224,18 @@ uv run python scripts/predict_sliced.py --model runs/visdrone_yolo11s_640_baseli
     --merge nms edge ios --out "runs/coco_eval/yolo11s_640_sliced_{merge}_val/detections.json"
 ```
 
+Speed (Ultralytics environment; TensorRT engines built with `tensorrt-cu13` 10.16):
+
+```bash
+yolo export model=runs/trt_640_fp16/best.pt format=engine imgsz=640 batch=1 device=0 half=True
+python scripts/benchmark.py --runtime onnx-cpu --model runs/visdrone_yolo11s_640_baseline/weights/best.onnx
+python scripts/benchmark.py --runtime torch-gpu-fp16 --model runs/visdrone_yolo11s_640_baseline/weights/best.pt
+python scripts/benchmark.py --runtime trt --model runs/trt_640_fp16/best.engine --preprocess gpu-aa
+# mAP of a runtime: all of val, low threshold, boxes saved for eval_coco.py
+python scripts/benchmark.py --runtime trt --model runs/trt_640_fp16/best.engine --preprocess gpu-aa \
+    --count 548 --warmup 0 --conf 0.001 --out runs/coco_eval/yolo11s_640_trt_fp16_gpuprepaa_val/detections.json
+```
+
 For test-dev, add `--images data/VisDrone/images/test`. Scoring, from a detection-eval checkout:
 
 ```bash
@@ -201,7 +256,7 @@ Training settings: YOLO11s from COCO-pretrained weights, 50 epochs, seed 0, batc
 ## Next
 
 - Video and FPS.
-- Speed and mAP table: PyTorch, ONNX Runtime, TensorRT FP16, browser.
+- In the speed table: the browser (ONNX Runtime Web) and TensorRT INT8.
 
 ## License
 
